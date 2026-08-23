@@ -14,6 +14,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <ctype.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -49,35 +50,74 @@ static struct pending_client clients[MAX_CLIENTS];
 static int parse_host_port(const char *input, char *host, size_t host_sz,
                            char *port, size_t port_sz)
 {
+    const char *s;
+    const char *slash;
     const char *sep;
     size_t hlen;
+    int i;
+    char tmp[512];
+    size_t inlen;
 
-    if (input[0] == '[') {
-        const char *rb = strchr(input, ']');
+    inlen = strlen(input);
+    if (inlen == 0 || inlen >= sizeof tmp) {
+        return -1;
+    }
+    memcpy(tmp, input, inlen + 1);
+
+    if (strncmp(tmp, "tcp://", 6) == 0) {
+        memmove(tmp, tmp + 6, strlen(tmp + 6) + 1);
+    } else if (strncmp(tmp, "udp://", 6) == 0) {
+        memmove(tmp, tmp + 6, strlen(tmp + 6) + 1);
+    }
+    s = tmp;
+
+    slash = strchr(s, '/');
+    if (slash != NULL) {
+        *(char *)slash = '\0';
+    }
+
+    for (i = 0; s[i]; i++) {
+        if (!isdigit((unsigned char)s[i])) {
+            break;
+        }
+    }
+    if (s[0] && s[i] == '\0') {
+        host[0] = '\0';
+        strncpy(port, s, port_sz - 1);
+        port[port_sz - 1] = '\0';
+        return 0;
+    }
+
+    if (s[0] == '[') {
+        const char *rb = strchr(s, ']');
         if (rb == NULL || rb[1] != ':') {
             return -1;
         }
-        hlen = (size_t)(rb - (input + 1));
+        hlen = (size_t)(rb - (s + 1));
         if (hlen == 0 || hlen >= host_sz) {
             return -1;
         }
-        memcpy(host, input + 1, hlen);
+        memcpy(host, s + 1, hlen);
         host[hlen] = '\0';
         strncpy(port, rb + 2, port_sz - 1);
         port[port_sz - 1] = '\0';
         return port[0] ? 0 : -1;
     }
 
-    sep = strrchr(input, ':');
-    if (sep == NULL || sep == input || sep[1] == '\0') {
+    sep = strrchr(s, ':');
+    if (sep == NULL || sep[1] == '\0') {
         return -1;
     }
-    hlen = (size_t)(sep - input);
-    if (hlen >= host_sz) {
-        return -1;
+    if (sep == s) {
+        host[0] = '\0';
+    } else {
+        hlen = (size_t)(sep - s);
+        if (hlen >= host_sz) {
+            return -1;
+        }
+        memcpy(host, s, hlen);
+        host[hlen] = '\0';
     }
-    memcpy(host, input, hlen);
-    host[hlen] = '\0';
     strncpy(port, sep + 1, port_sz - 1);
     port[port_sz - 1] = '\0';
     return 0;
@@ -421,6 +461,10 @@ int main(int argc, char **argv)
 
     initCalcLib();
     bind_host = map_special_host(host, &family);
+    if (bind_host[0] == '\0') {
+        bind_host = NULL;
+        family = AF_UNSPEC;
+    }
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = family;
@@ -428,7 +472,7 @@ int main(int argc, char **argv)
     hints.ai_flags = AI_PASSIVE;
     hints.ai_protocol = IPPROTO_UDP;
 
-    err = getaddrinfo(bind_host[0] ? bind_host : NULL, port, &hints, &res);
+    err = getaddrinfo(bind_host, port, &hints, &res);
     if (err != 0) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err));
         return 1;
@@ -442,8 +486,8 @@ int main(int argc, char **argv)
         }
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
         if (rp->ai_family == AF_INET6) {
-            int off = 0;
-            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
+            int on = 1;
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof on);
         }
         if (bind(fd, rp->ai_addr, rp->ai_addrlen) != 0) {
             close(fd);

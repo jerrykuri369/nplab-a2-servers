@@ -2,7 +2,7 @@ CC_FLAGS= -Wall -I.
 LD_FLAGS= -Wall -L./ 
 
 
-all: libcalc test tcpserver udpserver
+all: libcalc tcpserver udpserver
 
 tcpservermain.o: tcpservermain.cpp
 	$(CXX)  $(CC_FLAGS) $(CFLAGS) -c tcpservermain.cpp
@@ -28,7 +28,7 @@ calcLib.o: calcLib.c calcLib.h
 	gcc -Wall -fPIC -c calcLib.c
 
 libcalc: calcLib.o
-	ar -rc libcalc.a -o calcLib.o
+	ar rcs libcalc.a calcLib.o
 
 clean:
-	rm *.o *.a test tcpserver udpserver 
+	rm -f *.o *.a test tcpserver udpserver 

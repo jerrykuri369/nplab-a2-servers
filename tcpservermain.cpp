@@ -17,7 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -27,18 +29,108 @@
 
 #define OP_TIMEOUT 5
 
-static int client_fd = -1;
-
-static void on_alarm(int sig)
+static int wait_fd(int fd, int for_write, int seconds)
 {
-    (void)sig;
-    if (client_fd >= 0) {
-        const char *msg = "ERROR TO\n";
-        write(client_fd, msg, strlen(msg));
-        close(client_fd);
-        client_fd = -1;
+    fd_set fds;
+    struct timeval tv;
+    int r;
+
+    FD_ZERO(&fds);
+    FD_SET(fd, &fds);
+    tv.tv_sec = seconds;
+    tv.tv_usec = 0;
+    if (for_write) {
+        r = select(fd + 1, NULL, &fds, NULL, &tv);
+    } else {
+        r = select(fd + 1, &fds, NULL, NULL, &tv);
     }
-    _exit(1);
+    if (r < 0 && errno == EINTR) {
+        return wait_fd(fd, for_write, seconds);
+    }
+    return r;
+}
+
+static int send_error_to(int fd)
+{
+    const char *msg = "ERROR TO\n";
+    return (int)write(fd, msg, 9);
+}
+
+/* host:port, [ipv6]:port, port-only, optional tcp:// or udp:// prefix. */
+static int parse_host_port(const char *input, char *host, size_t host_sz,
+                           char *port, size_t port_sz)
+{
+    const char *s = input;
+    const char *slash;
+    const char *sep;
+    size_t hlen;
+    int i;
+    char tmp[512];
+    size_t inlen;
+
+    inlen = strlen(input);
+    if (inlen == 0 || inlen >= sizeof tmp) {
+        return -1;
+    }
+    memcpy(tmp, input, inlen + 1);
+
+    if (strncmp(tmp, "tcp://", 6) == 0) {
+        memmove(tmp, tmp + 6, strlen(tmp + 6) + 1);
+    } else if (strncmp(tmp, "udp://", 6) == 0) {
+        memmove(tmp, tmp + 6, strlen(tmp + 6) + 1);
+    }
+    s = tmp;
+
+    slash = strchr(s, '/');
+    if (slash != NULL) {
+        *(char *)slash = '\0';
+    }
+
+    for (i = 0; s[i]; i++) {
+        if (!isdigit((unsigned char)s[i])) {
+            break;
+        }
+    }
+    if (s[0] && s[i] == '\0') {
+        host[0] = '\0';
+        strncpy(port, s, port_sz - 1);
+        port[port_sz - 1] = '\0';
+        return 0;
+    }
+
+    if (s[0] == '[') {
+        const char *rb = strchr(s, ']');
+        if (rb == NULL || rb[1] != ':') {
+            return -1;
+        }
+        hlen = (size_t)(rb - (s + 1));
+        if (hlen == 0 || hlen >= host_sz) {
+            return -1;
+        }
+        memcpy(host, s + 1, hlen);
+        host[hlen] = '\0';
+        strncpy(port, rb + 2, port_sz - 1);
+        port[port_sz - 1] = '\0';
+        return port[0] ? 0 : -1;
+    }
+
+    sep = strrchr(s, ':');
+    if (sep == NULL || sep[1] == '\0') {
+        return -1;
+    }
+    if (sep == s) {
+        host[0] = '\0';
+    } else {
+        hlen = (size_t)(sep - s);
+        if (hlen >= host_sz) {
+            return -1;
+        }
+        memcpy(host, s, hlen);
+        host[hlen] = '\0';
+    }
+    strncpy(port, sep + 1, port_sz - 1);
+    port[port_sz - 1] = '\0';
+    return 0;
 }
 
 static void on_sigchld(int sig)
@@ -46,44 +138,6 @@ static void on_sigchld(int sig)
     (void)sig;
     while (waitpid(-1, NULL, WNOHANG) > 0) {
     }
-}
-
-/* host:port, [ipv6]:port, or last-colon split. */
-static int parse_host_port(const char *input, char *host, size_t host_sz,
-                           char *port, size_t port_sz)
-{
-    const char *sep;
-    size_t hlen;
-
-    if (input[0] == '[') {
-        const char *rb = strchr(input, ']');
-        if (rb == NULL || rb[1] != ':') {
-            return -1;
-        }
-        hlen = (size_t)(rb - (input + 1));
-        if (hlen == 0 || hlen >= host_sz) {
-            return -1;
-        }
-        memcpy(host, input + 1, hlen);
-        host[hlen] = '\0';
-        strncpy(port, rb + 2, port_sz - 1);
-        port[port_sz - 1] = '\0';
-        return port[0] ? 0 : -1;
-    }
-
-    sep = strrchr(input, ':');
-    if (sep == NULL || sep == input || sep[1] == '\0') {
-        return -1;
-    }
-    hlen = (size_t)(sep - input);
-    if (hlen >= host_sz) {
-        return -1;
-    }
-    memcpy(host, input, hlen);
-    host[hlen] = '\0';
-    strncpy(port, sep + 1, port_sz - 1);
-    port[port_sz - 1] = '\0';
-    return 0;
 }
 
 static const char *map_special_host(const char *host, int *family)
@@ -103,35 +157,49 @@ static const char *map_special_host(const char *host, int *family)
 static ssize_t timed_read(int fd, void *buf, size_t n)
 {
     size_t got = 0;
-    alarm(OP_TIMEOUT);
     while (got < n) {
+        int w = wait_fd(fd, 0, OP_TIMEOUT);
+        if (w == 0) {
+            send_error_to(fd);
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (w < 0) {
+            return -1;
+        }
         ssize_t r = read(fd, (char *)buf + got, n - got);
         if (r == 0) {
-            alarm(0);
             return (ssize_t)got;
         }
         if (r < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            alarm(0);
             return -1;
         }
         got += (size_t)r;
     }
-    alarm(0);
     return (ssize_t)got;
 }
 
 static ssize_t timed_read_line(int fd, char *buf, size_t cap)
 {
     size_t n = 0;
-    alarm(OP_TIMEOUT);
     while (n + 1 < cap) {
+        int w = wait_fd(fd, 0, OP_TIMEOUT);
+        if (w == 0) {
+            send_error_to(fd);
+            buf[n] = '\0';
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if (w < 0) {
+            buf[n] = '\0';
+            return -1;
+        }
         char c;
         ssize_t r = read(fd, &c, 1);
         if (r == 0) {
-            alarm(0);
             buf[n] = '\0';
             return (ssize_t)n;
         }
@@ -139,7 +207,7 @@ static ssize_t timed_read_line(int fd, char *buf, size_t cap)
             if (errno == EINTR) {
                 continue;
             }
-            alarm(0);
+            buf[n] = '\0';
             return -1;
         }
         buf[n++] = c;
@@ -147,7 +215,6 @@ static ssize_t timed_read_line(int fd, char *buf, size_t cap)
             break;
         }
     }
-    alarm(0);
     buf[n] = '\0';
     return (ssize_t)n;
 }
@@ -155,19 +222,20 @@ static ssize_t timed_read_line(int fd, char *buf, size_t cap)
 static int timed_write(int fd, const void *buf, size_t n)
 {
     size_t sent = 0;
-    alarm(OP_TIMEOUT);
     while (sent < n) {
-        ssize_t w = write(fd, (const char *)buf + sent, n - sent);
-        if (w < 0) {
+        int w = wait_fd(fd, 1, OP_TIMEOUT);
+        if (w <= 0) {
+            return -1;
+        }
+        ssize_t wr = write(fd, (const char *)buf + sent, n - sent);
+        if (wr < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            alarm(0);
             return -1;
         }
-        sent += (size_t)w;
+        sent += (size_t)wr;
     }
-    alarm(0);
     return 0;
 }
 
@@ -232,7 +300,6 @@ static void handle_text(int fd)
     }
 
     if (timed_read_line(fd, line, sizeof line) <= 0) {
-        timed_write(fd, "ERROR TO\n", 9);
         return;
     }
     strip_crlf(line);
@@ -273,7 +340,10 @@ static void handle_binary(int fd)
     }
 
     if (timed_read(fd, &ans, sizeof ans) != (ssize_t)sizeof ans) {
-        timed_write(fd, "ERROR TO\n", 9);
+        if (errno == ETIMEDOUT) {
+            return;
+        }
+        send_error_to(fd);
         return;
     }
 
@@ -298,14 +368,10 @@ static void handle_client(int fd)
     const char *hello = "TEXT TCP 1.1\nBINARY TCP 1.1\n\n";
     char line[256];
 
-    client_fd = fd;
-    signal(SIGALRM, on_alarm);
-
     if (timed_write(fd, hello, strlen(hello)) < 0) {
         return;
     }
     if (timed_read_line(fd, line, sizeof line) <= 0) {
-        timed_write(fd, "ERROR TO\n", 9);
         return;
     }
     strip_crlf(line);
@@ -346,8 +412,13 @@ int main(int argc, char **argv)
     initCalcLib();
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, on_sigchld);
+    signal(SIGALRM, SIG_IGN);
 
     bind_host = map_special_host(host, &family);
+    if (bind_host[0] == '\0') {
+        bind_host = NULL;
+        family = AF_UNSPEC;
+    }
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = family;
@@ -355,7 +426,7 @@ int main(int argc, char **argv)
     hints.ai_flags = AI_PASSIVE;
     hints.ai_protocol = IPPROTO_TCP;
 
-    err = getaddrinfo(bind_host[0] ? bind_host : NULL, port, &hints, &res);
+    err = getaddrinfo(bind_host, port, &hints, &res);
     if (err != 0) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err));
         return 1;
@@ -369,8 +440,8 @@ int main(int argc, char **argv)
         }
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
         if (rp->ai_family == AF_INET6) {
-            int off = 0;
-            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof off);
+            int on = 1;
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof on);
         }
         if (bind(fd, rp->ai_addr, rp->ai_addrlen) != 0 || listen(fd, 16) != 0) {
             close(fd);
