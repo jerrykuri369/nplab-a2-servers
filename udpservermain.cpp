@@ -25,18 +25,22 @@
 
 using namespace std;
 
-#define CLIENT_TTL_SEC 10
+#define CLIENT_TTL_SEC 10   /* a job is valid for 10 s; a reply at 11 s is rejected */
 #define MAX_CLIENTS 256
 #define MAX_DGRAM 2048
 
+/*
+ * UDP is stateless: the socket does not remember who last spoke.
+ * We store each waiting client ourselves, keyed by source address.
+ */
 struct pending_client {
   int in_use;
-  int binary;
-  int expected;
-  uint32_t id;
+  int binary;                 /* 0 = TEXT UDP, 1 = BINARY UDP */
+  int expected;               /* correct result for the job we sent */
+  uint32_t id;                /* calcProtocol id the client must echo */
   struct sockaddr_storage addr;
   socklen_t addrlen;
-  struct timespec deadline;
+  struct timespec deadline;   /* now + 10 s */
 };
 
 static struct pending_client clients[MAX_CLIENTS];
@@ -66,6 +70,7 @@ static int timespec_after(const struct timespec *a, const struct timespec *b)
   return a->tv_nsec > b->tv_nsec;
 }
 
+/* Drop clients that did not answer within 10 seconds. */
 static void expire_clients(void)
 {
   struct timespec now;
@@ -78,6 +83,7 @@ static void expire_clients(void)
   }
 }
 
+/* Remember this sender until they answer, or until the 10 s window closes. */
 static int store_client(const struct sockaddr_storage *addr, socklen_t len,
                         int binary, int expected, uint32_t id)
 {
@@ -130,6 +136,7 @@ static int arith_code(const char *op)
   return 0;
 }
 
+/* Random job from calcLib. Second operand is never 0 on division. */
 static void make_task(char *op, size_t opsz, int *a, int *b, int *expected)
 {
   const char *t = randomType();
@@ -167,6 +174,7 @@ static int is_text_hello(const char *buf, ssize_t n)
   return strcmp(tmp, "TEXT UDP 1.1") == 0;
 }
 
+/* First TEXT datagram: store the client and send "op a b\n". */
 static void send_text_job(int fd, const struct sockaddr *to, socklen_t tolen)
 {
   char op[16];
@@ -179,6 +187,7 @@ static void send_text_job(int fd, const struct sockaddr *to, socklen_t tolen)
   store_client((const struct sockaddr_storage *)to, tolen, 0, expected, 0);
 }
 
+/* First BINARY datagram: store the client and send a calcProtocol job. */
 static void send_binary_job(int fd, const struct sockaddr *to, socklen_t tolen)
 {
   char op[16];
@@ -190,7 +199,7 @@ static void send_binary_job(int fd, const struct sockaddr *to, socklen_t tolen)
   id = (uint32_t)(randomInt() + 1) * 1000u + (uint32_t)randomInt();
 
   memset(&job, 0, sizeof job);
-  job.type = htons(1);
+  job.type = htons(1);                 /* server -> client */
   job.major_version = htons(1);
   job.minor_version = htons(1);
   job.id = htonl(id);
@@ -208,13 +217,21 @@ static void reject_binary(int fd, const struct sockaddr *to, socklen_t tolen)
   calcMessage msg;
   memset(&msg, 0, sizeof msg);
   msg.type = htons(2);
-  msg.message = htonl(2);
-  msg.protocol = htons(17);
+  msg.message = htonl(2);              /* NOT OK */
+  msg.protocol = htons(17);            /* UDP */
   msg.major_version = htons(1);
   msg.minor_version = htons(1);
   sendto(fd, &msg, sizeof msg, 0, to, tolen);
 }
 
+/*
+ * Classify one datagram by size, then by content.
+ *   12 bytes  -> calcMessage (binary hello, type 22)
+ *   26 bytes  -> calcProtocol (binary answer)
+ *   printable -> TEXT hello or integer result
+ * Anything else is ignored or rejected. No assumption about who sent it
+ * until we match the source address against the pending table.
+ */
 static void handle_dgram(int fd, unsigned char *buf, ssize_t n,
                          struct sockaddr_storage *from, socklen_t fromlen)
 {
@@ -227,6 +244,7 @@ static void handle_dgram(int fd, unsigned char *buf, ssize_t n,
   clock_gettime(CLOCK_MONOTONIC, &now);
   idx = find_client(from, fromlen);
 
+  /* Binary hello: calcMessage type 22, protocol 17, version 1.1. */
   if (n == (ssize_t)sizeof(calcMessage)) {
     uint16_t type, major, minor, proto;
     uint32_t message;
@@ -246,6 +264,7 @@ static void handle_dgram(int fd, unsigned char *buf, ssize_t n,
     return;
   }
 
+  /* Binary answer: must be a known client, on time, matching id and result. */
   if (n == (ssize_t)sizeof(calcProtocol)) {
     uint16_t type, major, minor;
     uint32_t id;
@@ -280,6 +299,7 @@ static void handle_dgram(int fd, unsigned char *buf, ssize_t n,
     return;
   }
 
+  /* Text starts with a printable byte (>= 0x20). Binary types start with 0x00. */
   if (n <= 0 || buf[0] < 0x20) {
     return;
   }
@@ -289,6 +309,7 @@ static void handle_dgram(int fd, unsigned char *buf, ssize_t n,
     return;
   }
 
+  /* Second TEXT datagram: the integer result. Late or unknown clients are rejected. */
   {
     char tmp[64];
     int got;
@@ -351,6 +372,7 @@ int main(int argc, char *argv[]){
 
   initCalcLib();
 
+  /* One datagram socket. DNS may yield IPv4 or IPv6; bind the first that works. */
   struct addrinfo hints, *results = NULL, *p;
   int sockfd = -1;
   int yes = 1;
@@ -389,6 +411,10 @@ int main(int argc, char *argv[]){
     return EXIT_FAILURE;
   }
 
+  /*
+   * select() watches the single UDP socket. A 1 s tick also lets us expire
+   * clients that have gone past 10 s without blocking forever on recvfrom.
+   */
   for (;;) {
     fd_set reading;
     struct timeval timeout;
@@ -412,7 +438,7 @@ int main(int argc, char *argv[]){
       break;
     }
     if (rc == 0) {
-      continue;
+      continue;                 /* tick: no datagram, just re-check deadlines */
     }
 
     addrLen = sizeof clientAddr;

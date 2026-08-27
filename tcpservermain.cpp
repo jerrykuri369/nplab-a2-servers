@@ -25,8 +25,9 @@
 
 using namespace std;
 
-#define OP_TIMEOUT 5
+#define OP_TIMEOUT 5  /* every TCP step must finish within 5 seconds */
 
+/* Reap finished children so the parent does not collect zombie processes. */
 static void reap_children(int sig)
 {
   (void)sig;
@@ -34,6 +35,7 @@ static void reap_children(int sig)
   }
 }
 
+/* Block until fd is readable, or the 5 s client timeout elapses. */
 static int wait_ready(int fd, int seconds)
 {
   fd_set rfds;
@@ -72,6 +74,7 @@ static int send_error_to(int fd)
   return send_all(fd, "ERROR TO\n", 9);
 }
 
+/* Read exactly n bytes. On timeout send ERROR TO and return -1. */
 static ssize_t read_n(int fd, void *buf, size_t n)
 {
   size_t got = 0;
@@ -100,6 +103,7 @@ static ssize_t read_n(int fd, void *buf, size_t n)
   return (ssize_t)got;
 }
 
+/* Read one text line (up to newline). Same 5 s rule as read_n. */
 static ssize_t read_line(int fd, char *buf, size_t cap)
 {
   size_t n = 0;
@@ -145,6 +149,7 @@ static void strip_crlf(char *s)
   }
 }
 
+/* Map operator name to the binary arith field in protocol.h (1 add, 2 sub, 3 mul, 4 div). */
 static int arith_code(const char *op)
 {
   if (strcmp(op, "add") == 0) {
@@ -162,6 +167,7 @@ static int arith_code(const char *op)
   return 0;
 }
 
+/* Draw a random job from calcLib. Never allow a zero divisor. */
 static void make_task(char *op, size_t opsz, int *a, int *b, int *expected)
 {
   const char *t = randomType();
@@ -183,6 +189,10 @@ static void make_task(char *op, size_t opsz, int *a, int *b, int *expected)
   }
 }
 
+/*
+ * TEXT TCP 1.1
+ * Send "op a b\n", wait for the integer answer, reply OK or ERROR.
+ */
 static void handle_text(int fd)
 {
   char op[16];
@@ -211,6 +221,11 @@ static void handle_text(int fd)
   }
 }
 
+/*
+ * BINARY TCP 1.1
+ * Send a packed calcProtocol job (type 1). Client returns type 2 with inResult.
+ * Server answers with calcMessage: message 1 = OK, 2 = NOT OK. Protocol field 6 = TCP.
+ */
 static void handle_binary(int fd)
 {
   char op[16];
@@ -223,7 +238,7 @@ static void handle_binary(int fd)
   id = (uint32_t)(randomInt() + 1) * 1000u + (uint32_t)randomInt();
 
   memset(&job, 0, sizeof job);
-  job.type = htons(1);
+  job.type = htons(1);                 /* server -> client */
   job.major_version = htons(1);
   job.minor_version = htons(1);
   job.id = htonl(id);
@@ -244,21 +259,25 @@ static void handle_binary(int fd)
   }
 
   memset(&verdict, 0, sizeof verdict);
-  verdict.type = htons(2);
-  verdict.protocol = htons(6);
+  verdict.type = htons(2);             /* server -> client, binary */
+  verdict.protocol = htons(6);         /* TCP */
   verdict.major_version = htons(1);
   verdict.minor_version = htons(1);
 
   if (ntohs(ans.type) == 2 && ntohs(ans.major_version) == 1 &&
       ntohs(ans.minor_version) == 1 && ntohl(ans.id) == id &&
       (int32_t)ntohl((uint32_t)ans.inResult) == expected) {
-    verdict.message = htonl(1);
+    verdict.message = htonl(1);        /* OK */
   } else {
-    verdict.message = htonl(2);
+    verdict.message = htonl(2);        /* NOT OK */
   }
   send_all(fd, &verdict, sizeof verdict);
 }
 
+/*
+ * One connected client (runs in the child after fork).
+ * Advertise supported versions, then branch on the client's choice.
+ */
 static void handle_client(int fd)
 {
   const char *hello = "TEXT TCP 1.1\nBINARY TCP 1.1\n\n";
@@ -314,11 +333,13 @@ int main(int argc, char *argv[]){
   
   printf("TCP server on: %s:%s\n", hoststring,portstring);
 
+  /* Ignore SIGPIPE (write to a closed client) and SIGALRM from the grader. */
   initCalcLib();
   signal(SIGPIPE, SIG_IGN);
   signal(SIGCHLD, reap_children);
   signal(SIGALRM, SIG_IGN);
 
+  /* Resolve host (IPv4 and/or IPv6) and bind the first address that works. */
   struct addrinfo hints, *results = NULL, *p;
   int listenfd = -1;
   int yes = 1;
@@ -357,6 +378,7 @@ int main(int argc, char *argv[]){
     return EXIT_FAILURE;
   }
 
+  /* Accept loop: parent keeps listening; each client is handled in a child. */
   for (;;) {
     struct sockaddr_storage cli;
     socklen_t clilen = sizeof cli;
@@ -378,13 +400,13 @@ int main(int argc, char *argv[]){
       continue;
     }
     if (pid == 0) {
-      close(listenfd);
+      close(listenfd);          /* child does not accept further connections */
       initCalcLib();
       handle_client(clientfd);
       close(clientfd);
       _exit(0);
     }
-    close(clientfd);
+    close(clientfd);            /* parent is done with this connected socket */
   }
 
   return 0;
